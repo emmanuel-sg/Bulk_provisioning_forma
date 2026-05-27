@@ -75,7 +75,8 @@ def _fetch_new_token():
             "grant_type": "client_credentials",
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
-            "scope": "data:read account:read account:write",
+            # data:write is required for creating Docs folders (Data Management API).
+            "scope": "data:read data:write account:read account:write",
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )

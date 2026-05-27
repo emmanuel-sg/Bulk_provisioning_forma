@@ -12,6 +12,8 @@ Usage:
                 comparison) but skip actual import/update API calls.
     --add-only: Never update existing users. If email already exists
                 in the target project, skip that row.
+    --create-companies: If CSV company is missing in the hub, create it at
+                account level and then assign it.
 """
 
 import argparse
@@ -236,6 +238,44 @@ def fetch_account_companies(hub_id):
         offset += limit
 
     return acc_company_map
+
+
+# ---------------------------------------------------------------------------
+# Company creation (account-level)
+# ---------------------------------------------------------------------------
+
+def create_account_company(hub_id, company_name):
+    """Create an account-level company and return (company_id, error_message)."""
+    account_id = _strip_id(hub_id)
+    # Company creation is handled by the ACC "HQ" API, not the construction admin API.
+    # Ref: APS ACC docs (Companies) -> POST /hq/v1/accounts/:account_id/companies
+    url = f"{BASE_URL}/hq/v1/accounts/{account_id}/companies"
+
+    # The HQ API requires at least 'name' and 'trade'. Use a neutral default for trade.
+    body = {"name": (company_name or "").strip(), "trade": "Other"}
+    if not body["name"]:
+        return "", "empty company name"
+
+    extra = {"x-user-id": auth.USER_ID} if auth.USER_ID else None
+    resp, err = _api_post(url, body, extra_headers=extra)
+    if err:
+        return "", err
+
+    # ACC APIs sometimes return 200/201 with the created entity, sometimes 409 if it exists.
+    if resp.status_code in (200, 201):
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        cid = ""
+        if isinstance(data, dict):
+            cid = str(data.get("id", "")).strip()
+        return cid, "" if cid else "company created but response missing id"
+
+    if resp.status_code == 409:
+        return "", "company already exists (409)"
+
+    return "", f"HTTP {resp.status_code}: {resp.text[:300]}"
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +615,11 @@ def main():
         action="store_true",
         help="Only add missing users. If user email already exists in project, skip (no update).",
     )
+    parser.add_argument(
+        "--create-companies",
+        action="store_true",
+        help="If a CSV company is missing in the hub, create it at account level and assign it.",
+    )
     args, extras = parser.parse_known_args()
     if extras:
         if args.target is None and len(extras) == 1:
@@ -595,6 +640,7 @@ def main():
     target = (args.target or "").strip()
     dry_run = args.dry_run
     add_only = args.add_only
+    create_companies = args.create_companies
 
     if not target:
         env = auth.ACC_ENV
@@ -617,6 +663,8 @@ def main():
         print("  *** DRY-RUN MODE — no users will actually be imported ***")
     if add_only:
         print("  *** ADD-ONLY MODE — existing users are always skipped (by email) ***")
+    if create_companies:
+        print("  *** CREATE-COMPANIES MODE — missing companies will be created ***")
 
     hub_id = os.getenv(hub_key, "")
     if not hub_id:
@@ -645,23 +693,30 @@ def main():
     print(f"  {len(acc_company_map)} companies found")
 
     # --- Pre-fetch project users per project ---
+    #
+    # NOTE: This can be very slow for CSVs targeting many projects (N000 exports).
+    # In add-only mode we can skip prefetch entirely and let the import endpoint
+    # tell us if the user already exists; we'll then classify that as "skipped".
     acc_member_cache = {}  # project_id -> acc_user_map (email -> user details)
 
-    unique_projects = set()
-    for row in rows:
-        unique_projects.add(row["project_name"].strip().lower())
+    if add_only:
+        print("\nSkipping pre-fetch of project users (add-only mode).")
+    else:
+        unique_projects = set()
+        for row in rows:
+            unique_projects.add(row["project_name"].strip().lower())
 
-    print(f"\nPre-fetching users for {len(unique_projects)} unique projects...")
-    for proj_name in unique_projects:
-        proj = acc_project_map.get(proj_name)
-        if not proj:
-            continue
-        pid = proj["id"]
-        if pid not in acc_member_cache:
-            print(f"  Fetching users for: {proj['name']}...")
-            acc_user_map = fetch_project_users(pid)
-            acc_member_cache[pid] = acc_user_map
-            print(f"    {len(acc_user_map)} users")
+        print(f"\nPre-fetching users for {len(unique_projects)} unique projects...")
+        for proj_name in unique_projects:
+            proj = acc_project_map.get(proj_name)
+            if not proj:
+                continue
+            pid = proj["id"]
+            if pid not in acc_member_cache:
+                print(f"  Fetching users for: {proj['name']}...")
+                acc_user_map = fetch_project_users(pid)
+                acc_member_cache[pid] = acc_user_map
+                print(f"    {len(acc_user_map)} users")
 
     # --- Process rows ---
     added = []
@@ -720,6 +775,18 @@ def main():
         company_id = acc_company_map.get(company.strip().lower()) if company else None
         if company and not company_id:
             print(f"    (!) Company not found: {company}")
+            if create_companies:
+                if dry_run:
+                    print(f"    (dry-run) Would create company at account level: {company}")
+                else:
+                    created_id, create_err = create_account_company(hub_id, company)
+                    if create_err:
+                        print(f"    (!) Company create failed: {create_err}")
+                    # Re-fetch companies to pick up the new one (or pick up a pre-existing one if 409).
+                    acc_company_map = fetch_account_companies(hub_id)
+                    company_id = acc_company_map.get(company.strip().lower()) if company else None
+                    if company_id:
+                        print(f"    (+) Company resolved after create: {company} -> {company_id}")
 
         # 4. Check if user already exists in the project
         if email in acc_user_map:
@@ -806,11 +873,23 @@ def main():
                 for e in batch_entries:
                     email = e["email"]
                     if email in failure_map:
+                        reason = failure_map[email]
+                        # In add-only mode, treat "already in project" responses as skips.
+                        if add_only and any(s in (reason or "").lower() for s in ["already", "exists", "member"]):
+                            skipped.append(
+                                {
+                                    "email": email,
+                                    "project_name": e["project_name"],
+                                    "reason": f"already exists in project (add-only mode): {reason}",
+                                }
+                            )
+                            continue
+
                         failed.append(
                             {
                                 "email": email,
                                 "project_name": e["project_name"],
-                                "reason": failure_map[email],
+                                "reason": reason,
                             }
                         )
                     elif email in success_set:
